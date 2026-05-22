@@ -1,0 +1,373 @@
+import os
+import json
+import shutil
+import logging
+from src.config import AppPaths
+
+logger = logging.getLogger("migration")
+
+class FileMigrator:
+    """Handles migration of settings.json, extensions directories, and .gemini folder data."""
+    
+    def __init__(self, paths: AppPaths, dry_run: bool = False):
+        self.paths = paths
+        self.dry_run = dry_run
+        
+    def migrate_settings(self) -> None:
+        """Merges settings.json from old AppData to new AppData."""
+        old_settings_path = os.path.join(self.paths.old_roaming, "User", "settings.json")
+        new_settings_path = os.path.join(self.paths.new_roaming, "User", "settings.json")
+        
+        if not os.path.exists(old_settings_path):
+            logger.warning(f"Old settings.json not found at {old_settings_path}. Skipping settings migration.")
+            return
+            
+        logger.info(f"Migrating settings from {old_settings_path} to {new_settings_path}")
+        
+        try:
+            with open(old_settings_path, "r", encoding="utf-8") as f:
+                old_settings = json.load(f)
+        except Exception as e:
+            logger.error(f"Failed to read old settings.json: {e}")
+            return
+            
+        new_settings = {}
+        if os.path.exists(new_settings_path):
+            try:
+                with open(new_settings_path, "r", encoding="utf-8") as f:
+                    new_settings = json.load(f)
+            except Exception as e:
+                logger.error(f"Failed to read existing new settings.json: {e}")
+                
+        # Merge settings (old settings overwrite new settings)
+        merged = False
+        for key, value in old_settings.items():
+            if key not in new_settings or new_settings[key] != value:
+                logger.info(f"Updating setting: {key} -> {value}")
+                new_settings[key] = value
+                merged = True
+                
+        if merged:
+            if self.dry_run:
+                logger.info(f"[Dry-Run] Would write merged settings to {new_settings_path}")
+            else:
+                try:
+                    os.makedirs(os.path.dirname(new_settings_path), exist_ok=True)
+                    with open(new_settings_path, "w", encoding="utf-8") as f:
+                        json.dump(new_settings, f, indent=4, ensure_ascii=False)
+                    logger.info("Successfully merged settings.json")
+                except Exception as e:
+                    logger.error(f"Failed to write merged settings.json: {e}")
+                    raise e
+        else:
+            logger.info("No new settings to merge.")
+
+    def migrate_local_state(self) -> None:
+        """Copies or merges Local State containing safeStorage encryption master keys."""
+        old_local_state = os.path.join(self.paths.old_roaming, "Local State")
+        new_local_state = os.path.join(self.paths.new_roaming, "Local State")
+        
+        if not os.path.exists(old_local_state):
+            logger.warning(f"Old Local State not found at {old_local_state}. Skipping Local State migration.")
+            return
+            
+        logger.info(f"Migrating Local State from {old_local_state} to {new_local_state}")
+        
+        try:
+            with open(old_local_state, "r", encoding="utf-8") as f:
+                old_data = json.load(f)
+        except Exception as e:
+            logger.error(f"Failed to read old Local State: {e}")
+            return
+            
+        new_data = {}
+        if os.path.exists(new_local_state):
+            try:
+                with open(new_local_state, "r", encoding="utf-8") as f:
+                    new_data = json.load(f)
+            except Exception as e:
+                logger.error(f"Failed to read existing new Local State: {e}")
+                
+        # Overwrite new Local State's encryption key with the old one
+        old_os_crypt = old_data.get("os_crypt", {})
+        if old_os_crypt:
+            new_data["os_crypt"] = old_os_crypt
+            
+            if self.dry_run:
+                logger.info(f"[Dry-Run] Would write master encryption key to {new_local_state}")
+            else:
+                try:
+                    os.makedirs(os.path.dirname(new_local_state), exist_ok=True)
+                    with open(new_local_state, "w", encoding="utf-8") as f:
+                        json.dump(new_data, f, indent=4, ensure_ascii=False)
+                    logger.info("Successfully migrated Local State (safeStorage encryption key)")
+                except Exception as e:
+                    logger.error(f"Failed to write merged Local State: {e}")
+                    raise e
+
+    def migrate_user_data(self) -> None:
+        """Syncs profile-level user data directories that back recents and workspace state."""
+        user_dirs = [
+            "History",
+            "workspaceStorage",
+            "profiles",
+        ]
+
+        old_user_dir = os.path.join(self.paths.old_roaming, "User")
+        new_user_dir = os.path.join(self.paths.new_roaming, "User")
+
+        if not os.path.exists(old_user_dir):
+            logger.warning(f"Old User directory not found at {old_user_dir}. Skipping user data sync.")
+            return
+
+        logger.info(f"Synchronizing user data from {old_user_dir} to {new_user_dir}")
+
+        for sub_dir in user_dirs:
+            old_sub_path = os.path.join(old_user_dir, sub_dir)
+            new_sub_path = os.path.join(new_user_dir, sub_dir)
+
+            if not os.path.exists(old_sub_path):
+                logger.debug(f"User sub-directory not found: {old_sub_path}")
+                continue
+
+            if not os.path.exists(new_sub_path):
+                logger.info(f"Creating user sub-directory: {sub_dir}")
+                if not self.dry_run:
+                    os.makedirs(new_sub_path, exist_ok=True)
+
+            for root, dirs, files in os.walk(old_sub_path):
+                rel_root = os.path.relpath(root, old_sub_path)
+                target_root = new_sub_path if rel_root == "." else os.path.join(new_sub_path, rel_root)
+
+                if not os.path.exists(target_root):
+                    logger.info(f"Creating user data folder: {os.path.join(sub_dir, rel_root) if rel_root != '.' else sub_dir}")
+                    if not self.dry_run:
+                        os.makedirs(target_root, exist_ok=True)
+
+                for directory in dirs:
+                    target_dir = os.path.join(target_root, directory)
+                    if not os.path.exists(target_dir):
+                        logger.debug(f"Creating nested directory: {os.path.join(sub_dir, rel_root, directory) if rel_root != '.' else os.path.join(sub_dir, directory)}")
+                        if not self.dry_run:
+                            os.makedirs(target_dir, exist_ok=True)
+
+                for filename in files:
+                    src_file = os.path.join(root, filename)
+                    dest_file = os.path.join(target_root, filename)
+                    if not os.path.exists(dest_file):
+                        logger.info(f"Copying user data file: {os.path.join(sub_dir, rel_root, filename) if rel_root != '.' else os.path.join(sub_dir, filename)}")
+                    if not self.dry_run:
+                        shutil.copy2(src_file, dest_file)
+
+    def migrate_root_state(self) -> None:
+        """Migrates top-level app state used to reconnect sessions and workspaces."""
+        items_to_copy = [
+            "app_storage.json",
+            "CachedProfilesData",
+            "shared_proto_db",
+            "Backups",
+        ]
+
+        logger.info(f"Synchronizing root app state from {self.paths.old_roaming} to {self.paths.new_roaming}")
+
+        for item in items_to_copy:
+            old_item_path = os.path.join(self.paths.old_roaming, item)
+            new_item_path = os.path.join(self.paths.new_roaming, item)
+
+            if not os.path.exists(old_item_path):
+                logger.debug(f"Root state item not found: {old_item_path}")
+                continue
+
+            if os.path.isdir(old_item_path):
+                logger.info(f"Synchronizing root directory: {item}")
+                for root, dirs, files in os.walk(old_item_path):
+                    rel_root = os.path.relpath(root, old_item_path)
+                    target_root = new_item_path if rel_root == "." else os.path.join(new_item_path, rel_root)
+
+                    if not os.path.exists(target_root):
+                        logger.info(f"Creating root data folder: {os.path.join(item, rel_root) if rel_root != '.' else item}")
+                        if not self.dry_run:
+                            os.makedirs(target_root, exist_ok=True)
+
+                    for directory in dirs:
+                        target_dir = os.path.join(target_root, directory)
+                        if not os.path.exists(target_dir):
+                            logger.debug(f"Creating nested root directory: {os.path.join(item, rel_root, directory) if rel_root != '.' else os.path.join(item, directory)}")
+                            if not self.dry_run:
+                                os.makedirs(target_dir, exist_ok=True)
+
+                    for filename in files:
+                        src_file = os.path.join(root, filename)
+                        dest_file = os.path.join(target_root, filename)
+                        if not os.path.exists(dest_file):
+                            logger.info(f"Copying root state file: {os.path.join(item, rel_root, filename) if rel_root != '.' else os.path.join(item, filename)}")
+                            if not self.dry_run:
+                                shutil.copy2(src_file, dest_file)
+            else:
+                logger.info(f"Copying root file: {item}")
+                if not self.dry_run:
+                    os.makedirs(os.path.dirname(new_item_path), exist_ok=True)
+                    shutil.copy2(old_item_path, new_item_path)
+
+        old_storage_json = os.path.join(self.paths.old_roaming, "User", "globalStorage", "storage.json")
+        new_storage_json = os.path.join(self.paths.new_roaming, "User", "globalStorage", "storage.json")
+
+        if os.path.exists(old_storage_json):
+            logger.info(f"Migrating global storage registry from {old_storage_json} to {new_storage_json}")
+            try:
+                with open(old_storage_json, "r", encoding="utf-8") as f:
+                    old_storage = json.load(f)
+            except Exception as e:
+                logger.error(f"Failed to read old global storage registry: {e}")
+                return
+
+            new_storage = {}
+            if os.path.exists(new_storage_json):
+                try:
+                    with open(new_storage_json, "r", encoding="utf-8") as f:
+                        new_storage = json.load(f)
+                except Exception as e:
+                    logger.error(f"Failed to read existing new global storage registry: {e}")
+
+            merged_storage = dict(new_storage)
+            merged_storage.update(old_storage)
+
+            if self.dry_run:
+                logger.info(f"[Dry-Run] Would write migrated global storage registry to {new_storage_json}")
+            else:
+                try:
+                    os.makedirs(os.path.dirname(new_storage_json), exist_ok=True)
+                    with open(new_storage_json, "w", encoding="utf-8") as f:
+                        json.dump(merged_storage, f, indent=2, ensure_ascii=False)
+                    logger.info("Successfully migrated global storage registry")
+                except Exception as e:
+                    logger.error(f"Failed to write migrated global storage registry: {e}")
+                    raise e
+
+
+    def migrate_extensions(self) -> None:
+        """Copies physical extensions and merges/rewrites paths in extensions.json."""
+        old_ext_dir = os.path.join(self.paths.old_dot, "extensions")
+        new_ext_dir = os.path.join(self.paths.new_dot, "extensions")
+        
+        if not os.path.exists(old_ext_dir):
+            logger.warning(f"Old extensions directory not found at {old_ext_dir}. Skipping extensions migration.")
+            return
+            
+        logger.info(f"Migrating extensions from {old_ext_dir} to {new_ext_dir}")
+        
+        if not self.dry_run:
+            os.makedirs(new_ext_dir, exist_ok=True)
+            
+        # 1. Copy physical extension directories
+        try:
+            for item in os.listdir(old_ext_dir):
+                if item in [".obsolete", "extensions.json"]:
+                    continue
+                old_item_path = os.path.join(old_ext_dir, item)
+                new_item_path = os.path.join(new_ext_dir, item)
+                
+                if os.path.isdir(old_item_path):
+                    if not os.path.exists(new_item_path):
+                        logger.info(f"Copying extension directory: {item}")
+                        if not self.dry_run:
+                            shutil.copytree(old_item_path, new_item_path)
+                    else:
+                        logger.debug(f"Extension directory already exists: {item}")
+        except Exception as e:
+            logger.error(f"Failed to copy extension directories: {e}")
+            raise e
+            
+        # 2. Merge and rewrite extensions.json
+        old_json_path = os.path.join(old_ext_dir, "extensions.json")
+        new_json_path = os.path.join(new_ext_dir, "extensions.json")
+        
+        if os.path.exists(old_json_path):
+            try:
+                with open(old_json_path, "r", encoding="utf-8") as f:
+                    old_exts = json.load(f)
+            except Exception as e:
+                logger.error(f"Failed to read old extensions.json: {e}")
+                return
+                
+            new_exts = []
+            if os.path.exists(new_json_path):
+                try:
+                    with open(new_json_path, "r", encoding="utf-8") as f:
+                        new_exts = json.load(f)
+                except Exception as e:
+                    logger.error(f"Failed to read existing new extensions.json: {e}")
+                    
+            # Map existing extensions by ID
+            existing_ids = {ext["identifier"]["id"].lower() for ext in new_exts}
+            
+            merged_count = 0
+            for ext in old_exts:
+                ext_id = ext["identifier"]["id"].lower()
+                if ext_id not in existing_ids:
+                    # Convert paths in this extension metadata dict
+                    ext_str = json.dumps(ext)
+                    # Replace paths from .antigravity to .antigravity-ide
+                    ext_str = ext_str.replace("/.antigravity/extensions", "/.antigravity-ide/extensions")
+                    ext_str = ext_str.replace("\\.antigravity\\extensions", "\\.antigravity-ide\\extensions")
+                    ext_str = ext_str.replace(".antigravity/extensions", ".antigravity-ide/extensions")
+                    ext_str = ext_str.replace(".antigravity\\\\extensions", ".antigravity-ide\\\\extensions")
+                    
+                    merged_ext = json.loads(ext_str)
+                    new_exts.append(merged_ext)
+                    logger.info(f"Adding extension metadata for: {ext['identifier']['id']}")
+                    merged_count += 1
+                    
+            if merged_count > 0:
+                if self.dry_run:
+                    logger.info(f"[Dry-Run] Would write merged extensions.json to {new_json_path}")
+                else:
+                    try:
+                        with open(new_json_path, "w", encoding="utf-8") as f:
+                            json.dump(new_exts, f, indent=4, ensure_ascii=False)
+                        logger.info(f"Merged extensions.json successfully. Added {merged_count} items.")
+                    except Exception as e:
+                        logger.error(f"Failed to write merged extensions.json: {e}")
+                        raise e
+            else:
+                logger.info("No new extensions to merge in extensions.json.")
+
+    def migrate_gemini_data(self) -> None:
+        """Synchronizes conversations and other data under the .gemini directory."""
+        if not os.path.exists(self.paths.old_gemini):
+            logger.warning(f"Old Gemini directory not found at {self.paths.old_gemini}. Skipping Gemini data sync.")
+            return
+            
+        logger.info(f"Synchronizing Gemini data from {self.paths.old_gemini} to {self.paths.new_gemini}")
+        
+        # Folder list to check and copy
+        data_dirs = [
+            "conversations", "brain", "prompting", "scratch", "context_state",
+            "annotations", "browser_recordings", "html_artifacts", "implicit", "knowledge"
+        ]
+        
+        for sub_dir in data_dirs:
+            old_sub_path = os.path.join(self.paths.old_gemini, sub_dir)
+            new_sub_path = os.path.join(self.paths.new_gemini, sub_dir)
+            
+            if os.path.exists(old_sub_path):
+                if not os.path.exists(new_sub_path):
+                    logger.info(f"Creating new Gemini sub-directory: {sub_dir}")
+                    if not self.dry_run:
+                        os.makedirs(new_sub_path, exist_ok=True)
+                        
+                # Copy items inside
+                for item in os.listdir(old_sub_path):
+                    old_item_path = os.path.join(old_sub_path, item)
+                    new_item_path = os.path.join(new_sub_path, item)
+                    
+                    if os.path.isdir(old_item_path):
+                        if not os.path.exists(new_item_path):
+                            logger.info(f"Copying folder: {os.path.join(sub_dir, item)}")
+                            if not self.dry_run:
+                                shutil.copytree(old_item_path, new_item_path)
+                    else:
+                        if not os.path.exists(new_item_path):
+                            logger.info(f"Copying file: {os.path.join(sub_dir, item)}")
+                            if not self.dry_run:
+                                shutil.copy2(old_item_path, new_item_path)
